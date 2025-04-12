@@ -395,76 +395,171 @@ void alt_action_task(void* arg) {
 
 void gpio_task(void* arg) {
   gpioLockAction status;
-  while (1) {
-    if (gpio_lock_handle != nullptr) {
-      status = {};
-      if (uxQueueMessagesWaiting(gpio_lock_handle) > 0) {
-        xQueueReceive(gpio_lock_handle, &status, 0);
-        LOG(D, "Got something in queue - source = %d action = %d", status.source, status.action);
-        if (status.action == 0) {
-          LOG(D, "%d - %d - %d -%d", espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionMomentaryEnabled, espConfig::miscConfig.lockAlwaysUnlock, espConfig::miscConfig.lockAlwaysLock);
-          if (espConfig::miscConfig.lockAlwaysUnlock && status.source != gpioLockAction::HOMEKIT) {
-            lockTargetState->setVal(lockStates::UNLOCKED);
-            if(espConfig::miscConfig.gpioActionPin != 255){
-              digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionUnlockState);
-            }
-            lockCurrentState->setVal(lockStates::UNLOCKED);
-            if (client != nullptr) {
-              esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNLOCKED).c_str(), 1, 0, false);
-            } else LOG(W, "MQTT Client not initialized, cannot publish message");
+  bool initial_state_set = false; // Flag for initial setup
+  const TickType_t initial_delay_ticks = pdMS_TO_TICKS(1500); // Time for HomeSpan chars to init
+  const TickType_t loop_delay_ticks = pdMS_TO_TICKS(100); // Poll interval
 
-            if (static_cast<uint8_t>(espConfig::miscConfig.gpioActionMomentaryEnabled) & status.source) {
-              delay(espConfig::miscConfig.gpioActionMomentaryTimeout);
-              lockTargetState->setVal(lockStates::LOCKED);
-              if(espConfig::miscConfig.gpioActionPin != 255){
-                digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
+  LOG(I, "gpio_task started.");
+
+  while (1) {
+      // *** SET INITIAL GPIO STATE (runs only once after boot/task start) ***
+      if (!initial_state_set && espConfig::miscConfig.gpioActionPin != 255) {
+          // Wait a bit for HomeSpan characteristics to be ready
+          LOG(D, "gpio_task: Delaying %dms for initial state check...", pdTICKS_TO_MS(initial_delay_ticks));
+          vTaskDelay(initial_delay_ticks);
+
+          // Check if the global characteristic pointers are valid
+          if (lockCurrentState != nullptr && lockTargetState != nullptr) {
+              int current_state = lockCurrentState->getVal();
+              LOG(I, "gpio_task: Setting initial GPIO state based on LockCurrentState: %d", current_state);
+
+              uint8_t initial_level;
+              if (current_state == lockStates::LOCKED) {
+                  initial_level = espConfig::miscConfig.gpioActionLockState;
+              } else { // Assume UNLOCKED or other states use the unlock level initially
+                  initial_level = espConfig::miscConfig.gpioActionUnlockState;
               }
-              lockCurrentState->setVal(lockStates::LOCKED);
-              if (client != nullptr) {
-                esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKED).c_str(), 1, 0, false);
-              } else LOG(W, "MQTT Client not initialized, cannot publish message");
-            }
-          } else if (espConfig::miscConfig.lockAlwaysLock && status.source != gpioLockAction::HOMEKIT) {
-            lockTargetState->setVal(lockStates::LOCKED);
-            if(espConfig::miscConfig.gpioActionPin != 255){
-              digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
-            }
-            lockCurrentState->setVal(lockStates::LOCKED);
-            if (client != nullptr) {
-              esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKED).c_str(), 1, 0, false);
-            } else LOG(W, "MQTT Client not initialized, cannot publish message");
+
+              // Ensure pin is output
+              pinMode(espConfig::miscConfig.gpioActionPin, OUTPUT);
+              // Write initial state
+              digitalWrite(espConfig::miscConfig.gpioActionPin, initial_level);
+              initial_state_set = true;
+              LOG(I, "gpio_task: Initial GPIO pin %d set to level %d", espConfig::miscConfig.gpioActionPin, initial_level);
+
+              // Ensure target state matches initial current state if needed
+               if(lockTargetState->getVal() != current_state) {
+                    LOG(I, "gpio_task: Aligning initial target state to current state (%d)", current_state);
+                    lockTargetState->setVal(current_state);
+               }
+
           } else {
-            int currentState = lockCurrentState->getVal();
-            if (status.source != gpioLockAction::HOMEKIT) {
-              lockTargetState->setVal(!currentState);
-            }
-            if(espConfig::miscConfig.gpioActionPin != 255){
-              digitalWrite(espConfig::miscConfig.gpioActionPin, currentState == lockStates::UNLOCKED ? espConfig::miscConfig.gpioActionLockState : espConfig::miscConfig.gpioActionUnlockState);
-            }
-            lockCurrentState->setVal(!currentState);
-            if (client != nullptr) {
-              esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockCurrentState->getNewVal()).c_str(), 1, 0, false);
-            } else LOG(W, "MQTT Client not initialized, cannot publish message");
-            if ((static_cast<uint8_t>(espConfig::miscConfig.gpioActionMomentaryEnabled) & status.source) && currentState == lockStates::LOCKED) {
-              delay(espConfig::miscConfig.gpioActionMomentaryTimeout);
-              lockTargetState->setVal(currentState);
-              if(espConfig::miscConfig.gpioActionPin != 255){
-                digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
-              }
-              lockCurrentState->setVal(currentState);
-              if (client != nullptr) {
-                esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockCurrentState->getNewVal()).c_str(), 1, 0, false);
-              } else LOG(W, "MQTT Client not initialized, cannot publish message");
-            }
+               LOG(E, "gpio_task: lockCurrentState/lockTargetState characteristic not valid for initial state set!");
+               // Optionally retry or set a default safe state (e.g., locked)
+               // pinMode(espConfig::miscConfig.gpioActionPin, OUTPUT);
+               // digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
+               // initial_state_set = true; // Mark as set even if fallback?
           }
-        } else if (status.action == 2) {
-          vTaskDelete(NULL);
-          return;
-        }
       }
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
+      // Reset flag if pin gets disabled via web config later
+      if (espConfig::miscConfig.gpioActionPin == 255 && initial_state_set) {
+           LOG(I, "gpio_task: gpioActionPin disabled, resetting initial_state_set flag.");
+           initial_state_set = false;
+      }
+
+
+      // *** PROCESS QUEUE MESSAGES ***
+      if (gpio_lock_handle != nullptr) {
+          // Check queue without blocking (timeout 0)
+          if (xQueueReceive(gpio_lock_handle, &status, 0) == pdPASS) {
+              LOG(D, "gpio_task: Received action - source=%d action=%d", status.source, status.action);
+
+              // Only process if GPIO pin is currently enabled
+              if (espConfig::miscConfig.gpioActionPin == 255 && !espConfig::miscConfig.hkDumbSwitchMode) {
+                  LOG(W, "gpio_task: Received action but gpioActionPin is disabled (and not dumb mode). Ignoring.");
+                  // Skip rest of processing for this message
+              }
+              // Process action 0 (state change request)
+              else if (status.action == 0) {
+                  if(lockTargetState == nullptr || lockCurrentState == nullptr) {
+                      LOG(E, "gpio_task: Characteristics pointers invalid, cannot process action 0.");
+                      continue; // Skip to next loop iteration
+                  }
+
+                  int target_state_val = lockTargetState->getNewVal(); // Get intended state
+                  uint8_t gpio_level_to_set;
+                  bool isUnlockAction = (target_state_val == lockStates::UNLOCKED);
+
+                  LOG(D, "GPIO Task Action: Target State=%d", target_state_val);
+
+                  // Determine GPIO level based on target state
+                  if (isUnlockAction) {
+                      gpio_level_to_set = espConfig::miscConfig.gpioActionUnlockState;
+                      // Set intermediate HomeKit state for feedback
+                      if(lockCurrentState->getVal() != lockStates::UNLOCKING) {
+                           lockCurrentState->setVal(lockStates::UNLOCKING);
+                           if (client) esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNLOCKING).c_str(), 0, 1, true);
+                      }
+                  } else { // Target is LOCKED
+                      gpio_level_to_set = espConfig::miscConfig.gpioActionLockState;
+                       // Set intermediate HomeKit state for feedback
+                      if(lockCurrentState->getVal() != lockStates::LOCKING) {
+                          lockCurrentState->setVal(lockStates::LOCKING);
+                           if (client) esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKING).c_str(), 0, 1, true);
+                      }
+                  }
+
+                  // --- Perform Physical Action ---
+                  if (espConfig::miscConfig.gpioActionPin != 255) { // Only write if pin is valid
+                      LOG(D, "GPIO Task: Writing pin %d to level %d", espConfig::miscConfig.gpioActionPin, gpio_level_to_set);
+                      digitalWrite(espConfig::miscConfig.gpioActionPin, gpio_level_to_set);
+                  } else if (espConfig::miscConfig.hkDumbSwitchMode) {
+                      // Dumb switch mode might just mean "toggle" regardless of target state
+                      // Or maybe it simulates a momentary press? Define this behaviour.
+                      // Example: Simple Toggle (assumes it needs a pulse)
+                      LOG(D, "GPIO Task: Dumb Switch Mode - Simulating momentary toggle");
+                      uint8_t pressLevel = espConfig::miscConfig.gpioActionUnlockState; // Or some dedicated pulse level?
+                      uint8_t releaseLevel = espConfig::miscConfig.gpioActionLockState; // Or inverse of pressLevel?
+                      // Assume hkDumbSwitchMode uses gpioActionPin if set, otherwise needs a pin? Error if 255?
+                       if(espConfig::miscConfig.gpioActionPin != 255) {
+                           digitalWrite(espConfig::miscConfig.gpioActionPin, pressLevel);
+                           vTaskDelay(pdMS_TO_TICKS(espConfig::miscConfig.gpioActionMomentaryTimeout > 0 ? espConfig::miscConfig.gpioActionMomentaryTimeout : 200)); // Use timeout or default
+                           digitalWrite(espConfig::miscConfig.gpioActionPin, releaseLevel);
+                       } else {
+                            LOG(E, "Dumb Switch Mode enabled but no valid gpioActionPin configured!");
+                       }
+                      // In dumb mode, HK state might just toggle immediately
+                      lockCurrentState->setVal(target_state_val);
+                      if (client) esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(target_state_val).c_str(), 0, 1, true);
+                      continue; // Skip momentary logic below for dumb mode? Or adapt it?
+                  }
+                   // --- End Physical Action ---
+
+
+                  // --- Momentary Logic (Only if NOT Dumb Mode and pin is valid) ---
+                  if (espConfig::miscConfig.gpioActionPin != 255 && isUnlockAction && (static_cast<uint8_t>(espConfig::miscConfig.gpioActionMomentaryEnabled) & status.source)) {
+                      LOG(D, "GPIO Task: Starting momentary delay (%d ms) for UNLOCK", espConfig::miscConfig.gpioActionMomentaryTimeout);
+                      vTaskDelay(pdMS_TO_TICKS(espConfig::miscConfig.gpioActionMomentaryTimeout));
+
+                      LOG(D, "GPIO Task: Momentary timeout, returning pin %d to LOCK level (%d).", espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
+                      digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
+
+                      // Update HomeKit state AFTER momentary action completes
+                      // Check if HomeKit still expects UNLOCKED (user might have changed target during delay)
+                      if(lockTargetState->getVal() == lockStates::UNLOCKED) {
+                          LOG(D,"GPIO Task: Momentary done, setting TargetState back to LOCKED");
+                          lockTargetState->setVal(lockStates::LOCKED); // Re-target to Locked
+                      }
+                      lockCurrentState->setVal(lockStates::LOCKED); // Set current to Locked
+                      if (client) esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKED).c_str(), 0, 1, true);
+
+                  } else if (espConfig::miscConfig.gpioActionPin != 255) {
+                      // If NOT momentary, or if it was a LOCK action:
+                      // Physical action is done, update HomeKit current state to match the final target state
+                      LOG(D, "GPIO Task: Non-momentary action complete, setting CurrentState to %d", target_state_val);
+                      // Optional short delay if physical lock needs time to settle before updating state
+                      // vTaskDelay(pdMS_TO_TICKS(200));
+                      lockCurrentState->setVal(target_state_val);
+                      if (client) esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(target_state_val).c_str(), 0, 1, true);
+                  }
+                  // --- End Momentary Logic ---
+
+              }
+              // Process action 2 (stop task command)
+              else if (status.action == 2) {
+                  LOG(I, "gpio_task stopping command received.");
+                  vTaskDelete(NULL); // Gracefully delete self
+                  return; // Exit function
+              }
+          } // End if xQueueReceive successful
+      } else {
+          // Handle case where queue handle is somehow null (shouldn't happen if setup is correct)
+          LOG(E, "gpio_task: gpio_lock_handle is NULL!");
+          vTaskDelay(pdMS_TO_TICKS(1000)); // Delay longer before retrying
+      }
+
+      vTaskDelay(loop_delay_ticks); // Prevent task from hogging CPU
+  } // End while(1)
 }
 
 void neopixel_task(void* arg) {
@@ -556,34 +651,37 @@ struct LockMechanism : Service::LockMechanism
     lockTargetState = new Characteristic::LockTargetState(1, true);
     memcpy(ecpData + 8, readerData.reader_gid.data(), readerData.reader_gid.size());
     with_crc16(ecpData, 16, ecpData + 16);
-    if (espConfig::miscConfig.gpioActionPin != 255) {
-      if (lockCurrentState->getVal() == lockStates::LOCKED) {
-        digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
-      } else if (lockCurrentState->getVal() == lockStates::UNLOCKED) {
-        digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionUnlockState);
-      }
-    }
   } // end constructor
 
   boolean update() {
     int targetState = lockTargetState->getNewVal();
     LOG(I, "New LockState=%d, Current LockState=%d", targetState, lockCurrentState->getVal());
-    if (espConfig::miscConfig.gpioActionPin != 255) {
-      const gpioLockAction gpioAction{ .source = gpioLockAction::HOMEKIT, .action = 0 };
-      xQueueSend(gpio_lock_handle, &gpioAction, 0);
-    } else if (espConfig::miscConfig.hkDumbSwitchMode) {
-      const gpioLockAction gpioAction{ .source = gpioLockAction::HOMEKIT, .action = 0 };
-      xQueueSend(gpio_lock_handle, &gpioAction, 0);
-    }
-    int currentState = lockCurrentState->getNewVal();
-    if (client != nullptr) {
-      if (espConfig::miscConfig.gpioActionPin == 255) {
-        if (targetState != currentState) {
-          esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), targetState == lockStates::UNLOCKED ? std::to_string(lockStates::UNLOCKING).c_str() : std::to_string(lockStates::LOCKING).c_str(), 1, 1, true);
-        } else {
-          esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(currentState).c_str(), 1, 1, true);
-        }
+
+    // This part is CORRECT - it sends the action to the gpio_task queue
+    if ((espConfig::miscConfig.gpioActionPin != 255 && espConfig::miscConfig.hkGpioControlledState) || espConfig::miscConfig.hkDumbSwitchMode) {
+      // Only send to queue if the pin is enabled OR dumb switch mode is on
+      const gpioLockAction gpioAction{ .source = gpioLockAction::HOMEKIT, .action = 0 }; // action 0 = process state change
+      LOG(D, "LockMechanism::update() sending action to gpio_task queue.");
+      // Use a small timeout for the queue send in case the queue is full
+      if (xQueueSend(gpio_lock_handle, &gpioAction, pdMS_TO_TICKS(50)) != pdPASS) {
+           LOG(E, "Failed to send action to gpio_lock_handle queue!");
       }
+    } else {
+         LOG(D, "LockMechanism::update() - GPIO action pin disabled or not HK controlled, not sending to queue.");
+         // If the pin is disabled, maybe update current state immediately?
+         // lockCurrentState->setVal(targetState); // Or let gpio_task handle this? 
+    }
+
+    int currentState = lockCurrentState->getNewVal(); // Use getNewVal as it reflects intermediate states maybe? Or getVal()? Test this.
+    if (client != nullptr) {
+        // Report intermediate states if possible (gpio_task might set these)
+        if(currentState == lockStates::UNLOCKING || currentState == lockStates::LOCKING) {
+             esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(currentState).c_str(), 1, 1, true);
+        } else {
+            // Report final target state once reached (gpio_task should update this)
+             esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(targetState).c_str(), 1, 1, true);
+        }
+
       if (espConfig::mqttData.lockEnableCustomState) {
         if (targetState == lockStates::UNLOCKED) {
           esp_mqtt_client_publish(client, espConfig::mqttData.lockCustomStateTopic.c_str(), std::to_string(espConfig::mqttData.customLockActions["UNLOCK"]).c_str(), 0, 0, false);
@@ -593,6 +691,8 @@ struct LockMechanism : Service::LockMechanism
       }
     } else LOG(W, "MQTT Client not initialized, cannot publish message");
 
+    // HomeSpan expects update() to return true if the action is accepted.
+    // Since we delegate to gpio_task, we should usually return true here.
     return (true);
   }
 };
@@ -777,71 +877,77 @@ void print_issuers(const char* buf) {
  *  received custom state value
  */
 void set_custom_state_handler(esp_mqtt_client_handle_t client, int state) {
+  // Ensure states that imply an ACTION (like UNLOCKING/LOCKING) primarily set the target state.
+  // States that just REPORT status (like UNLOCKED/LOCKED/JAMMED) should set the current state.
+
   if (espConfig::mqttData.customLockStates["C_UNLOCKING"] == state) {
-    lockTargetState->setVal(lockStates::UNLOCKED);
+    LOG(I, "MQTT set_custom_state_handler: Received C_UNLOCKING. Setting target state.");
+    lockTargetState->setVal(lockStates::UNLOCKED); // Use Target State to trigger action
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNLOCKING).c_str(), 0, 1, true);
     return;
   } else if (espConfig::mqttData.customLockStates["C_LOCKING"] == state) {
-    lockTargetState->setVal(lockStates::LOCKED);
+    LOG(I, "MQTT set_custom_state_handler: Received C_LOCKING. Setting target state.");
+    lockTargetState->setVal(lockStates::LOCKED); // Use Target State to trigger action
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKING).c_str(), 0, 1, true);
     return;
   } else if (espConfig::mqttData.customLockStates["C_UNLOCKED"] == state) {
-    if (espConfig::miscConfig.gpioActionPin != 255) {
-      digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionUnlockState);
-    }
+     LOG(I, "MQTT set_custom_state_handler: Received C_UNLOCKED. Updating current state.");
+    // This reports the lock IS unlocked. Only update CurrentState.
+    // Don't call digitalWrite here. If the GPIO needs setting, the source should ensure it happened.
     lockCurrentState->setVal(lockStates::UNLOCKED);
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNLOCKED).c_str(), 0, 1, true);
     return;
   } else if (espConfig::mqttData.customLockStates["C_LOCKED"] == state) {
-    if (espConfig::miscConfig.gpioActionPin != 255) {
-      digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
-    }
+     LOG(I, "MQTT set_custom_state_handler: Received C_LOCKED. Updating current state.");
+    // This reports the lock IS locked. Only update CurrentState.
     lockCurrentState->setVal(lockStates::LOCKED);
+    // Optional: Ensure TargetState matches if necessary?
+    // if(lockTargetState->getVal() != lockStates::LOCKED) lockTargetState->setVal(lockStates::LOCKED);
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKED).c_str(), 0, 1, true);
     return;
   } else if (espConfig::mqttData.customLockStates["C_JAMMED"] == state) {
+    LOG(I, "MQTT set_custom_state_handler: Received C_JAMMED. Updating current state.");
     lockCurrentState->setVal(lockStates::JAMMED);
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::JAMMED).c_str(), 0, 1, true);
     return;
   } else if (espConfig::mqttData.customLockStates["C_UNKNOWN"] == state) {
+    LOG(I, "MQTT set_custom_state_handler: Received C_UNKNOWN. Updating current state.");
     lockCurrentState->setVal(lockStates::UNKNOWN);
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNKNOWN).c_str(), 0, 1, true);
     return;
   }
-  LOG(D, "Update state failed! Recv value not valid");
+  LOG(W, "MQTT set_custom_state_handler: Update state failed! Received invalid custom state value: %d", state);
 }
 
 void set_state_handler(esp_mqtt_client_handle_t client, int state) {
   switch (state) {
   case lockStates::UNLOCKED:
-    if (espConfig::miscConfig.gpioActionPin != 255) {
-      digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionUnlockState);
-    }
-    lockTargetState->setVal(state);
-    lockCurrentState->setVal(state);
-    esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNLOCKED).c_str(), 0, 1, true);
+    // REMOVE: digitalWrite call block
+    LOG(I, "MQTT set_state_handler: Received UNLOCK command. Setting target state.");
+    lockTargetState->setVal(state); // Trigger HomeKit update -> LockMechanism::update -> gpio_task
+    // lockCurrentState->setVal(state); // Don't set current state here, let gpio_task confirm it
+    esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::UNLOCKING).c_str(), 0, 1, true); // Publish UNLOCKING state
     if (espConfig::mqttData.lockEnableCustomState) {
       esp_mqtt_client_publish(client, espConfig::mqttData.lockCustomStateTopic.c_str(), std::to_string(espConfig::mqttData.customLockActions["UNLOCK"]).c_str(), 0, 0, false);
     }
     break;
   case lockStates::LOCKED:
-    if (espConfig::miscConfig.gpioActionPin != 255) {
-      digitalWrite(espConfig::miscConfig.gpioActionPin, espConfig::miscConfig.gpioActionLockState);
-    }
-    lockTargetState->setVal(state);
-    lockCurrentState->setVal(state);
-    esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKED).c_str(), 0, 1, true);
+    LOG(I, "MQTT set_state_handler: Received LOCK command. Setting target state.");
+    lockTargetState->setVal(state); // Trigger HomeKit update -> LockMechanism::update -> gpio_task
+    // lockCurrentState->setVal(state); // Don't set current state here
+    esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(lockStates::LOCKING).c_str(), 0, 1, true); // Publish LOCKING state
     if (espConfig::mqttData.lockEnableCustomState) {
       esp_mqtt_client_publish(client, espConfig::mqttData.lockCustomStateTopic.c_str(), std::to_string(espConfig::mqttData.customLockActions["LOCK"]).c_str(), 0, 0, false);
     }
     break;
-  case lockStates::JAMMED:
+  case lockStates::JAMMED: // These only update CURRENT state, no physical action triggered
   case lockStates::UNKNOWN:
+    LOG(I, "MQTT set_state_handler: Received non-actionable state %d. Updating current state.", state);
     lockCurrentState->setVal(state);
     esp_mqtt_client_publish(client, espConfig::mqttData.lockStateTopic.c_str(), std::to_string(state).c_str(), 0, 1, true);
     break;
   default:
-    LOG(D, "Update state failed! Recv value not valid");
+    LOG(W, "MQTT set_state_handler: Update state failed! Received invalid state value: %d", state);
     break;
   }
 }
