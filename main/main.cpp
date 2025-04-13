@@ -2219,6 +2219,11 @@ void setup() {
   }
   if (espConfig::miscConfig.gpioActionPin && espConfig::miscConfig.gpioActionPin != 255) {
     pinMode(espConfig::miscConfig.gpioActionPin, OUTPUT);
+    uint8_t initial_safe_level = espConfig::miscConfig.gpioActionLockState ? HIGH : LOW;
+    
+    digitalWrite(espConfig::miscConfig.gpioActionPin, initial_safe_level);
+    LOG(I, "Setup: Setting initial safe state for Action Pin %d to %s (Locked Level)",
+        espConfig::miscConfig.gpioActionPin, initial_safe_level == HIGH ? "HIGH" : "LOW");
   }
   if (espConfig::miscConfig.hkAltActionInitPin != 255) {
     pinMode(espConfig::miscConfig.hkAltActionInitPin, INPUT);
