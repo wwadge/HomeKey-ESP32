@@ -485,7 +485,7 @@ void gpio_task(void* arg) {
       // *** SET INITIAL GPIO STATE (runs only once after boot/task start) ***
       if (!initial_state_set && espConfig::miscConfig.gpioActionPin != 255) {
           // Wait a bit for HomeSpan characteristics to be ready
-          LOG(D, "gpio_task: Delaying %dms for initial state check...", pdTICKS_TO_MS(initial_delay_ticks));
+          LOG(D, "gpio_task: Delaying %dms for initial state check...", initial_delay_ticks);
           vTaskDelay(initial_delay_ticks);
 
           // Check if the global characteristic pointers are valid
